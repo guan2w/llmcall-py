@@ -1,0 +1,45 @@
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+env/
+venv/
+.venv/
+ENV/
+
+# 包含依赖和构建文件
+*.egg-info/
+dist/
+build/
+
+# 单元测试缓存
+.pytest_cache/
+.coverage
+.cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# 操作系统生成的临时文件
+.DS_Store
+Thumbs.db
+
+# IDE 配置
+.vscode/
+.idea/
+
+# 日志、配置、excel 等
+.env
+*.toml
+*.xlsx
+*.log
+*.7z
+*.zip
+*.tar.gz
+
+# 采集结果，如 json/html 等放在这样命名的路径下，如 rankings/usnews/scraped-250612/ 目录下
+scraped-*/**
+*.json
+*.html
+/data/

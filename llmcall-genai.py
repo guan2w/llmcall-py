@@ -21,6 +21,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from google import genai
+from google.genai import types
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -83,7 +84,9 @@ def merge_llm_config(cfg: dict, llm_name: str, cli_api_key: Optional[str]) -> di
     if cli_api_key:
         merged["api_key"] = cli_api_key
 
-    # 必要字段检查（Google GenAI SDK 不需要 api_base）
+    # 必要字段检查
+    # api_base 为可选，如果提供则用于自定义 API 端点
+    api_base = merged.get("api_base")
     api_key = merged.get("api_key")
     model_id = merged.get("model_id")
     if not (api_key or merged.get("user_token")):
@@ -357,18 +360,29 @@ def main():
     price_in = float(llm_cfg.get("price_per_1m_input_tokens", 0.0))
     price_out = float(llm_cfg.get("price_per_1m_output_tokens", 0.0))
 
+    api_base = llm_cfg.get("api_base")
+    
     log("启动参数：")
     log(f"- input-file: {xlsx_path}")
     log(f"- llm: {args.llm}")
     log(f"- model_id: {model_id}")
     log(f"- api_key: {mask_key_tail(api_key)}")
+    if api_base:
+        log(f"- api_base: {api_base}")
     log(f"- parallel: {parallel}, retry_times: {retry_times}, retry_delay: {retry_delay}s, timeout: {timeout}s")
     if args.rows:
         log(f"- rows: {args.rows}")
 
     # 创建 Google GenAI 客户端
     try:
-        client = genai.Client(api_key=api_key)
+        # 如果提供了 api_base，使用 http_options 自定义端点
+        if api_base:
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(base_url=api_base)
+            )
+        else:
+            client = genai.Client(api_key=api_key)
     except Exception as e:
         print(f"无法创建 GenAI 客户端：{e}", file=sys.stderr)
         sys.exit(2)

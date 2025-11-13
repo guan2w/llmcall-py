@@ -22,6 +22,10 @@ import requests
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
+# --- 列名配置 ---
+COL_FOUND = "是否找到"  # 结果状态列名
+COL_ERROR = "错误"      # 错误信息列名
+
 # --- 配置解析（tomllib 优先） ---
 try:
     import tomllib  # py311+
@@ -359,13 +363,13 @@ def main():
         print("QA 页缺少表头列：Q", file=sys.stderr)
         sys.exit(2)
     # 确保必要列
-    headers = ensure_columns(ws_qa, headers, ["是否找到", "错误"])
+    headers = ensure_columns(ws_qa, headers, [COL_FOUND, COL_ERROR])
     col_Q = headers["Q"]
-    col_found = headers["是否找到"]
-    col_err = headers["错误"]
+    col_found = headers[COL_FOUND]
+    col_err = headers[COL_ERROR]
 
     # 输出字段集合：表头中除去 Q/是否找到/错误 的其它列（仅写这些）
-    output_cols = {k: v for k, v in headers.items() if k not in ("Q", "是否找到", "错误")}
+    output_cols = {k: v for k, v in headers.items() if k not in ("Q", COL_FOUND, COL_ERROR)}
 
     data_start_row = 2
     data_end_row_initial = ws_qa.max_row  # 启动时的原始末行（用于 rows 范围）

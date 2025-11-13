@@ -23,8 +23,8 @@ from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
 # --- 列名配置 ---
-COL_FOUND = "是否找到"  # 结果状态列名
-COL_ERROR = "错误"      # 错误信息列名
+COL_FOUND = "FOUND"  # 结果状态列名
+COL_ERROR = "ERROR"      # 错误信息列名
 
 # --- 配置解析（tomllib 优先） ---
 try:

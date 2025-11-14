@@ -99,8 +99,15 @@ def merge_llm_config(cfg: dict, llm_name: str, cli_api_key: Optional[str]) -> di
     merged.setdefault("retry_times", 1)
     merged.setdefault("retry_delay", 10)
     merged.setdefault("timeout", 120)
+    
     # 联网搜索功能（默认关闭）
     merged.setdefault("enable_google_search", False)
+    
+    # 生成参数（可选）
+    # temperature: 控制随机性，0.0-2.0，默认不设置（使用模型默认值）
+    # thinking_budget: 思考预算，-1 表示无限制，默认不设置
+    # 这些参数如果在配置中未设置，则不传递给 API（使用 API 默认值）
+    
     return merged
 
 
@@ -212,6 +219,8 @@ def call_llm_genai(
     user_content: str,
     timeout: int,
     tools: Optional[List[types.Tool]] = None,
+    temperature: Optional[float] = None,
+    thinking_budget: Optional[int] = None,
     debug: bool = False,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any], Optional[str]]:
     """
@@ -225,6 +234,8 @@ def call_llm_genai(
         user_content: 用户内容
         timeout: 超时时间（秒）
         tools: 可选的工具列表（如 Google Search），用于启用联网搜索等功能
+        temperature: 温度参数，控制随机性（0.0-2.0）
+        thinking_budget: 思考预算，-1 表示无限制
         debug: 是否启用调试模式，打印请求和响应内容
     
     注意：timeout 参数保留在函数签名中以保持接口一致性，
@@ -243,6 +254,16 @@ def call_llm_genai(
         # 添加 tools（如果提供）
         if tools:
             config_kwargs["tools"] = tools
+        
+        # 添加 temperature（如果提供）
+        if temperature is not None:
+            config_kwargs["temperature"] = temperature
+        
+        # 添加 thinking_config（如果提供）
+        if thinking_budget is not None:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=thinking_budget
+            )
         
         # 创建配置对象（如果有任何配置）
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
@@ -462,6 +483,15 @@ def main():
     
     enable_google_search = bool(llm_cfg.get("enable_google_search", False))
     
+    # 生成参数（可选）
+    temperature = llm_cfg.get("temperature")  # None 或浮点数
+    if temperature is not None:
+        temperature = float(temperature)
+    
+    thinking_budget = llm_cfg.get("thinking_budget")  # None 或整数
+    if thinking_budget is not None:
+        thinking_budget = int(thinking_budget)
+    
     log("启动参数：")
     log(f"- input-file: {xlsx_path}")
     log(f"- llm: {args.llm}")
@@ -473,6 +503,10 @@ def main():
         log(f"- api_base: (使用默认 Google API)")
     log(f"- parallel: {parallel}, retry_times: {retry_times}, retry_delay: {retry_delay}s, timeout: {timeout}s")
     log(f"- enable_google_search: {enable_google_search}")
+    if temperature is not None:
+        log(f"- temperature: {temperature}")
+    if thinking_budget is not None:
+        log(f"- thinking_budget: {thinking_budget}")
     if args.rows:
         log(f"- rows: {args.rows}")
 
@@ -607,7 +641,8 @@ def main():
 
         # 请求
         arr, usage, err = retry_call(
-            client, model_id, sys_prompt, qtext, timeout, tools, args.debug
+            client, model_id, sys_prompt, qtext, timeout, tools,
+            temperature, thinking_budget, args.debug
         )
 
         if usage:

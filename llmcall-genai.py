@@ -99,6 +99,8 @@ def merge_llm_config(cfg: dict, llm_name: str, cli_api_key: Optional[str]) -> di
     merged.setdefault("retry_times", 1)
     merged.setdefault("retry_delay", 10)
     merged.setdefault("timeout", 120)
+    # 联网搜索功能（默认关闭）
+    merged.setdefault("enable_google_search", False)
     return merged
 
 
@@ -209,39 +211,70 @@ def call_llm_genai(
     system_prompt: str,
     user_content: str,
     timeout: int,
+    tools: Optional[List[types.Tool]] = None,
+    debug: bool = False,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any], Optional[str]]:
     """
     调用 Google GenAI SDK 的 generate_content 接口。
     返回：(json_array或None, usage字典, 错误文本或None)
+    
+    参数:
+        client: GenAI 客户端
+        model: 模型 ID
+        system_prompt: 系统提示词
+        user_content: 用户内容
+        timeout: 超时时间（秒）
+        tools: 可选的工具列表（如 Google Search），用于启用联网搜索等功能
+        debug: 是否启用调试模式，打印请求和响应内容
     
     注意：timeout 参数保留在函数签名中以保持接口一致性，
     但 Google GenAI SDK 的 generate_content 可能不直接支持该参数。
     超时控制可能需要通过 Client 配置或其他方式实现。
     """
     try:
-        # 构建调用参数
-        # Google GenAI SDK 的 generate_content 支持 system_instruction 参数
-        # 如果不支持，则将 system prompt 前置到 user content
-        call_kwargs = {
-            "model": model,
-            "contents": user_content,
-        }
+        # 构建配置对象
+        # 新版 SDK 要求通过 GenerateContentConfig 传递所有配置参数
+        config_kwargs = {}
         
-        # 尝试添加 system_instruction 参数（如果 SDK 支持）
+        # 添加 system_instruction
         if system_prompt:
-            try:
-                # 先尝试使用 system_instruction 参数
-                call_kwargs["system_instruction"] = system_prompt
-                response = client.models.generate_content(**call_kwargs)
-            except (TypeError, AttributeError):
-                # 如果 system_instruction 不支持，将 system prompt 合并到 contents
-                call_kwargs.pop("system_instruction", None)
-                call_kwargs["contents"] = f"{system_prompt}\n\n{user_content}"
-                response = client.models.generate_content(**call_kwargs)
-        else:
-            response = client.models.generate_content(**call_kwargs)
+            config_kwargs["system_instruction"] = system_prompt
+        
+        # 添加 tools（如果提供）
+        if tools:
+            config_kwargs["tools"] = tools
+        
+        # 创建配置对象（如果有任何配置）
+        config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+        
+        # 调试模式：打印请求信息
+        if debug:
+            log("=" * 60)
+            log("📤 API 请求详情")
+            log("=" * 60)
+            log(f"模型: {model}")
+            log(f"系统提示 (前200字): {compact_preview(system_prompt, 200) if system_prompt else '(无)'}")
+            log(f"用户内容 (前200字): {compact_preview(user_content, 200)}")
+            if tools:
+                log(f"工具: {[str(t) for t in tools]}")
+            log("=" * 60)
+        
+        # 调用 API
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config=config
+        )
         
     except Exception as e:
+        if debug:
+            log("=" * 60)
+            log("❌ 请求异常")
+            log("=" * 60)
+            log(f"错误: {type(e).__name__}: {e}")
+            import traceback
+            log(f"堆栈:\n{traceback.format_exc()}")
+            log("=" * 60)
         return None, {}, f"请求异常: {type(e).__name__}: {e}"
 
     # 提取响应文本
@@ -249,6 +282,29 @@ def call_llm_genai(
         content = response.text
     except Exception as e:
         return None, {}, f"响应缺少 text 属性: {type(e).__name__}: {e}"
+
+    # 调试模式：打印响应信息
+    if debug:
+        log("=" * 60)
+        log("📥 API 响应详情")
+        log("=" * 60)
+        log(f"原始响应 (前500字): {compact_preview(content, 500)}")
+        
+        # 检查 grounding metadata（联网搜索信息）
+        if hasattr(response, 'candidates') and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                metadata = candidate.grounding_metadata
+                log(f"🌐 联网搜索信息:")
+                if hasattr(metadata, 'web_search_queries') and metadata.web_search_queries:
+                    log(f"  搜索查询: {metadata.web_search_queries}")
+                if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks:
+                    log(f"  搜索结果数: {len(metadata.grounding_chunks)}")
+                    for i, chunk in enumerate(metadata.grounding_chunks[:3], 1):
+                        if hasattr(chunk, 'web') and chunk.web:
+                            title = getattr(chunk.web, 'title', 'N/A')
+                            uri = getattr(chunk.web, 'uri', 'N/A')
+                            log(f"    {i}. {title}: {uri}")
 
     # 提取 usage 信息（如果存在）
     usage = {}
@@ -269,23 +325,49 @@ def call_llm_genai(
                 "completion_tokens": getattr(usage_obj, 'completion_tokens', 0) or getattr(usage_obj, 'output_tokens', 0) or 0,
                 "total_tokens": getattr(usage_obj, 'total_tokens', 0) or 0,
             }
+        
+        if debug and usage:
+            log(f"📊 Token 使用: prompt={usage.get('prompt_tokens', 0)}, "
+                f"completion={usage.get('completion_tokens', 0)}, "
+                f"total={usage.get('total_tokens', 0)}")
     except Exception:
         # 如果无法提取 usage，继续执行（usage 为空字典）
         pass
 
     # 解析 JSON 数组
     content = extract_json_array_from_text(str(content))
+    
+    if debug:
+        log(f"提取的 JSON (前500字): {compact_preview(content, 500)}")
+    
     try:
         arr = json.loads(content)
     except Exception as e:
+        if debug:
+            log(f"❌ JSON 解析失败: {type(e).__name__}: {e}")
+            log("=" * 60)
         return None, usage, f"内容不是 JSON 数组: {type(e).__name__}: {e}; 原文片段: {content[:1000]}"
 
     if not isinstance(arr, list):
+        if debug:
+            log(f"❌ 顶层不是数组，而是: {type(arr)}")
+            log("=" * 60)
         return None, usage, "顶层非数组"
+    
     # 元素必须为对象
     for i, it in enumerate(arr):
         if not isinstance(it, dict):
+            if debug:
+                log(f"❌ 数组第 {i+1} 个元素不是对象")
+                log("=" * 60)
             return None, usage, f"数组第 {i+1} 个元素不是对象"
+    
+    if debug:
+        log(f"✅ 成功解析 JSON 数组，包含 {len(arr)} 个元素")
+        if arr:
+            log(f"第一个元素的键: {list(arr[0].keys())}")
+        log("=" * 60)
+    
     return arr, usage, None
 
 
@@ -340,7 +422,20 @@ def main():
     parser.add_argument("--llm", required=True, help="使用的模型配置名，例如 genai_2_5_flash_latest")
     parser.add_argument("--rows", default=None, help="处理行范围，例如 2-5 或 2+；缺省处理全部")
     parser.add_argument("--api-key", default=None, help="可选；命令行覆盖配置中的 api_key")
+    parser.add_argument("--debug", action="store_true", help="启用调试模式，输出详细日志")
     args = parser.parse_args()
+    
+    # 如果启用调试模式，配置日志
+    if args.debug:
+        import logging
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        # 为相关的 logger 设置 DEBUG 级别
+        for logger_name in ['google', 'google_genai', 'httpx', 'httpcore']:
+            logging.getLogger(logger_name).setLevel(logging.DEBUG)
+        log("已启用调试模式")
 
     xlsx_path = args.input_file
     if not os.path.exists(xlsx_path):
@@ -361,6 +456,11 @@ def main():
     price_out = float(llm_cfg.get("price_per_1m_output_tokens", 0.0))
 
     api_base = llm_cfg.get("api_base")
+    # 空字符串视为未设置
+    if api_base is not None and str(api_base).strip() == "":
+        api_base = None
+    
+    enable_google_search = bool(llm_cfg.get("enable_google_search", False))
     
     log("启动参数：")
     log(f"- input-file: {xlsx_path}")
@@ -369,7 +469,10 @@ def main():
     log(f"- api_key: {mask_key_tail(api_key)}")
     if api_base:
         log(f"- api_base: {api_base}")
+    else:
+        log(f"- api_base: (使用默认 Google API)")
     log(f"- parallel: {parallel}, retry_times: {retry_times}, retry_delay: {retry_delay}s, timeout: {timeout}s")
+    log(f"- enable_google_search: {enable_google_search}")
     if args.rows:
         log(f"- rows: {args.rows}")
 
@@ -386,6 +489,20 @@ def main():
     except Exception as e:
         print(f"无法创建 GenAI 客户端：{e}", file=sys.stderr)
         sys.exit(2)
+
+    # 创建工具（如果启用联网搜索）
+    tools = None
+    if enable_google_search:
+        try:
+            # 创建 Google Search 工具（使用 google_search 而不是 google_search_retrieval）
+            # API 要求使用 google_search，而不是已弃用的 google_search_retrieval
+            google_search = types.GoogleSearch()
+            google_search_tool = types.Tool(google_search=google_search)
+            tools = [google_search_tool]
+            log("✓ 已启用 Google 联网搜索功能")
+        except Exception as e:
+            log(f"⚠ 创建 Google Search 工具失败: {e}，将不使用联网搜索")
+            tools = None
 
     # 读 Excel
     try:
@@ -490,7 +607,7 @@ def main():
 
         # 请求
         arr, usage, err = retry_call(
-            client, model_id, sys_prompt, qtext, timeout
+            client, model_id, sys_prompt, qtext, timeout, tools, args.debug
         )
 
         if usage:

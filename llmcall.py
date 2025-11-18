@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-LLM 批量调用：读取 Excel（prompt & QA），按 QA 的 Q 列逐行请求 LLM，
+LLM 批量调用：读取 Excel（prompt & QA），按模板逐行构造提示并请求 LLM，
 将 JSON 数组结果展开写回原文件。满足：
-- 展开结果的所有行：Q 与 是否找到 相同
+- prompt 表：system 列存放系统提示，user 列存放用户提示模板（含 {{field}} 变量）
+- QA 表：从各列读取数据填充模板变量，生成用户提示
+- 展开结果的所有行：输入字段与 FOUND 相同
 - 每个输入处理完成后立即落盘
-- 支持 rows 范围、断点续跑、并发请求（请求并发，写入串行）
+- 支持 rows 范围、断点续跑、输入字段组合去重统计
 """
 
 import argparse
@@ -164,6 +166,35 @@ def ensure_columns(ws: Worksheet, headers: Dict[str, int], need_cols: List[str])
 def compact_preview(text: str, limit: int = 30) -> str:
     text = (text or "").replace("\n", " ").strip()
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+def extract_template_variables(template: str) -> List[str]:
+    """
+    从模板中提取所有 {{variable}} 格式的变量名。
+    返回：去重后的变量名列表
+    """
+    pattern = r'\{\{([^}]+)\}\}'
+    matches = re.findall(pattern, template)
+    # 去除空格并去重，保持顺序
+    seen = set()
+    result = []
+    for m in matches:
+        name = m.strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def fill_template(template: str, values: Dict[str, str]) -> str:
+    """
+    用字典中的值填充模板中的 {{variable}} 占位符。
+    """
+    result = template
+    for key, value in values.items():
+        placeholder = f"{{{{{key}}}}}"
+        result = result.replace(placeholder, str(value))
+    return result
 
 
 def is_json_array_text(s: str) -> bool:
@@ -350,44 +381,96 @@ def main():
     ws_prompt = get_sheet(wb, "prompt")
     ws_qa = get_sheet(wb, "QA")
 
-    # 系统提示（prompt!A1）
-    sys_prompt = ws_prompt["A1"].value
-    if sys_prompt is None or str(sys_prompt).strip() == "":
-        print("prompt!A1 不能为空", file=sys.stderr)
+    # 读取 prompt 表的表头和数据（第1行=表头，第2行=数据）
+    prompt_headers = find_header_indexes(ws_prompt)
+    if "system" not in prompt_headers:
+        print("prompt 表缺少 system 列", file=sys.stderr)
         sys.exit(2)
-    sys_prompt = str(sys_prompt)
+    if "user" not in prompt_headers:
+        print("prompt 表缺少 user 列", file=sys.stderr)
+        sys.exit(2)
+    
+    col_prompt_system = prompt_headers["system"]
+    col_prompt_user = prompt_headers["user"]
+    
+    # 读取第2行数据
+    sys_prompt = ws_prompt.cell(row=2, column=col_prompt_system).value
+    user_template = ws_prompt.cell(row=2, column=col_prompt_user).value
+    
+    if sys_prompt is None or str(sys_prompt).strip() == "":
+        print("prompt 表 system 列第2行不能为空", file=sys.stderr)
+        sys.exit(2)
+    if user_template is None or str(user_template).strip() == "":
+        print("prompt 表 user 列第2行不能为空", file=sys.stderr)
+        sys.exit(2)
+    
+    sys_prompt = str(sys_prompt).strip()
+    user_template = str(user_template).strip()
+    
+    # 提取模板中的所有输入字段
+    input_fields = extract_template_variables(user_template)
+    if not input_fields:
+        print("user 模板中没有找到任何 {{变量}}，至少需要一个输入字段", file=sys.stderr)
+        sys.exit(2)
+    
+    log(f"用户提示模板: {compact_preview(user_template, 60)}")
+    log(f"提取到的输入字段: {input_fields}")
 
     # QA 表头
     headers = find_header_indexes(ws_qa)
-    if "Q" not in headers:
-        print("QA 页缺少表头列：Q", file=sys.stderr)
+    
+    # 验证所有输入字段都存在于 QA 表中
+    missing_fields = [f for f in input_fields if f not in headers]
+    if missing_fields:
+        print(f"QA 表缺少模板所需的字段列: {missing_fields}", file=sys.stderr)
         sys.exit(2)
+    
     # 确保必要列
     headers = ensure_columns(ws_qa, headers, [COL_FOUND, COL_ERROR])
-    col_Q = headers["Q"]
     col_found = headers[COL_FOUND]
     col_err = headers[COL_ERROR]
-
-    # 输出字段集合：表头中除去 Q/是否找到/错误 的其它列（仅写这些）
-    output_cols = {k: v for k, v in headers.items() if k not in ("Q", COL_FOUND, COL_ERROR)}
+    
+    # 输入字段列索引
+    input_cols = {field: headers[field] for field in input_fields}
+    
+    # 输出字段集合：表头中除去输入字段/FOUND/ERROR 的其它列（仅写这些）
+    excluded = set(input_fields) | {COL_FOUND, COL_ERROR}
+    output_cols = {k: v for k, v in headers.items() if k not in excluded}
+    
+    log(f"输入字段列: {list(input_cols.keys())}")
+    log(f"输出字段列: {list(output_cols.keys())}")
 
     data_start_row = 2
     data_end_row_initial = ws_qa.max_row  # 启动时的原始末行（用于 rows 范围）
     target_rows = parse_rows_arg(args.rows, data_start_row, data_end_row_initial)
 
-    # 统计去重 Q：全部候选 + 已完成
-    q_all = []
-    q_done_set = set()
+    # 统计去重：基于所有输入字段的组合值
+    # 构造 key: 将所有输入字段值拼接为元组
+    def make_input_key(row: int) -> Optional[Tuple[str, ...]]:
+        values = []
+        for field in input_fields:
+            col_idx = input_cols[field]
+            val = ws_qa.cell(row=row, column=col_idx).value
+            val_str = "" if val is None else str(val).strip()
+            values.append(val_str)
+        # 如果所有字段都为空，则视为无效行
+        if all(v == "" for v in values):
+            return None
+        return tuple(values)
+    
+    keys_all = []
+    keys_done_set = set()
     for r in target_rows:
-        qv = ws_qa.cell(row=r, column=col_Q).value
-        if qv is None or str(qv).strip() == "":
+        key = make_input_key(r)
+        if key is None:
             continue
-        q_all.append(str(qv))
+        keys_all.append(key)
         found_v = ws_qa.cell(row=r, column=col_found).value
         if found_v is not None and str(found_v).strip() != "":
-            q_done_set.add(str(qv))
-    q_all_unique = set(q_all)
-    log(f"候选 Q 去重统计：总 {len(q_all_unique)}，其中已完成 {len(q_done_set)}")
+            keys_done_set.add(key)
+    
+    keys_all_unique = set(keys_all)
+    log(f"候选输入组合去重统计：总 {len(keys_all_unique)} 个唯一输入，其中已完成 {len(keys_done_set)}")
 
     # 为 rows 范围执行插入偏移跟踪：记录“原始主行” -> 插入的额外行数
     inserted_below: Dict[int, int] = {}
@@ -421,30 +504,46 @@ def main():
 
     for idx, r0 in enumerate(target_rows, start=1):
         r = current_row_pos(r0)
-        qv = ws_qa.cell(row=r, column=col_Q).value
-        qtext = "" if qv is None else str(qv).strip()
-
-        # 判定是否跳过（断点续跑：主行 是否找到 非空就跳过）
+        
+        # 读取所有输入字段的值
+        input_values = {}
+        missing_or_empty = []
+        for field in input_fields:
+            col_idx = input_cols[field]
+            val = ws_qa.cell(row=r, column=col_idx).value
+            val_str = "" if val is None else str(val).strip()
+            input_values[field] = val_str
+            if val_str == "":
+                missing_or_empty.append(field)
+        
+        # 构造输入字段预览（用于日志）
+        input_preview = ", ".join([f"{k}='{compact_preview(v, 20)}'" for k, v in input_values.items()])
+        
+        # 判定是否跳过（断点续跑：主行 FOUND 非空就跳过）
         found_val = ws_qa.cell(row=r, column=col_found).value
         if found_val is not None and str(found_val).strip() != "":
             n_done += 1
-            log(f"{idx}/{total} 跳过（已完成） r={r} Q='{compact_preview(qtext)}'")
+            log(f"{idx}/{total} 跳过（已完成） 行{r} [{input_preview}]")
             continue
 
-        if qtext == "":
-            # 空 Q：标记错误并继续
+        # 验证输入字段不能为空
+        if missing_or_empty:
+            err_msg = f"输入字段为空: {missing_or_empty}"
             ws_qa.cell(row=r, column=col_found, value="错误")
-            ws_qa.cell(row=r, column=col_err, value="Q 为空")
+            ws_qa.cell(row=r, column=col_err, value=err_msg)
             save_with_backup_atomic(wb, xlsx_path, made_backup)
             n_done += 1
             n_error += 1
-            log(f"{idx}/{total} 错误：Q 为空（r={r}），已落盘")
+            log(f"{idx}/{total} 错误：{err_msg}（行{r}），已落盘")
             continue
 
+        # 用输入字段值填充用户提示模板
+        user_prompt = fill_template(user_template, input_values)
+        
         # 组消息
         messages = [
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": qtext},
+            {"role": "user", "content": user_prompt},
         ]
 
         # 请求
@@ -463,12 +562,12 @@ def main():
             save_with_backup_atomic(wb, xlsx_path, made_backup)
             n_done += 1
             n_error += 1
-            log(f"{idx}/{total} 错误 r={r} Q='{compact_preview(qtext)}' -> {err}")
+            log(f"{idx}/{total} 错误 行{r} [{input_preview}] -> {err}")
             continue
 
         # arr 一定是 list[dict]
         if len(arr) == 0:
-            # 无结果：主行写“否”，不插入新行
+            # 无结果：主行写"否"，不插入新行
             ws_qa.cell(row=r, column=col_found, value="否")
             ws_qa.cell(row=r, column=col_err, value="")
             # 清空输出列
@@ -478,12 +577,12 @@ def main():
             inserted_below[r0] = 0
             n_done += 1
             n_empty += 1
-            log(f"{idx}/{total} 空结果 r={r} Q='{compact_preview(qtext)}'（已落盘）")
+            log(f"{idx}/{total} 空结果 行{r} [{input_preview}]（已落盘）")
             continue
 
         # 有结果：主行写第1个，下面插入 len(arr)-1 行写其余
-        # 所有展开行的 Q 与 是否找到 相同
-        ws_qa.cell(row=r, column=col_Q, value=qtext)
+        # 所有展开行的输入字段与 FOUND 相同
+        # 主行已有输入字段值，只需写控制列和输出列
         ws_qa.cell(row=r, column=col_found, value="是")
         ws_qa.cell(row=r, column=col_err, value="")
         # 写输出字段
@@ -500,9 +599,13 @@ def main():
             # 逐条写入
             for i in range(extra):
                 rr = r + 1 + i
-                ws_qa.cell(row=rr, column=col_Q, value=qtext)
+                # 复制所有输入字段的值
+                for field, col_idx in input_cols.items():
+                    ws_qa.cell(row=rr, column=col_idx, value=input_values[field])
+                # 写控制列
                 ws_qa.cell(row=rr, column=col_found, value="是")
                 ws_qa.cell(row=rr, column=col_err, value="")
+                # 写输出字段
                 obj = arr[1 + i]
                 for name, c in output_cols.items():
                     v = obj.get(name, "")
@@ -514,7 +617,7 @@ def main():
         save_with_backup_atomic(wb, xlsx_path, made_backup)
         n_done += 1
         n_success += 1
-        log(f"{idx}/{total} 成功 r={r} Q='{compact_preview(qtext)}' 展开 {len(arr)} 行（已落盘）")
+        log(f"{idx}/{total} 成功 行{r} [{input_preview}] 展开 {len(arr)} 行（已落盘）")
 
     # 结束统计
     cost = 0.0

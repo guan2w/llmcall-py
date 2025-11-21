@@ -103,6 +103,9 @@ def merge_llm_config(cfg: dict, llm_name: str, cli_api_key: Optional[str]) -> di
     # 联网搜索功能（默认关闭）
     merged.setdefault("enable_google_search", False)
     
+    # URL Context 功能（默认开启）
+    merged.setdefault("enable_url_context", True)
+    
     # 生成参数（可选）
     # temperature: 控制随机性，0.0-2.0，默认不设置（使用模型默认值）
     # thinking_budget: 思考预算，-1 表示无限制，默认不设置
@@ -175,6 +178,48 @@ def ensure_columns(ws: Worksheet, headers: Dict[str, int], need_cols: List[str])
 def compact_preview(text: str, limit: int = 30) -> str:
     text = (text or "").replace("\n", " ").strip()
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+def extract_template_vars(template: str) -> List[str]:
+    """
+    从模板中提取所有 {{变量名}} 占位符，返回去重后的变量名列表。
+    例如："查找{{学校名称}}在{{城市}}的信息" -> ["学校名称", "城市"]
+    """
+    pattern = r'\{\{([^}]+)\}\}'
+    matches = re.findall(pattern, template)
+    # 去除空格并去重，保持顺序
+    seen = set()
+    result = []
+    for m in matches:
+        name = m.strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def fill_template(template: str, values: Dict[str, Any]) -> str:
+    """
+    用字典值填充模板中的 {{变量名}} 占位符。
+    例如：template="查找{{学校名称}}的信息", values={"学校名称": "北京一中"} 
+         -> "查找北京一中的信息"
+    """
+    result = template
+    for key, val in values.items():
+        placeholder = f"{{{{{key}}}}}"
+        result = result.replace(placeholder, str(val))
+    return result
+
+
+def is_empty_value(val: Any) -> bool:
+    """
+    判断是否为空值：None、空字符串、纯空格
+    """
+    if val is None:
+        return True
+    if isinstance(val, str) and val.strip() == "":
+        return True
+    return False
 
 
 def is_json_array_text(s: str) -> bool:
@@ -482,6 +527,7 @@ def main():
         api_base = None
     
     enable_google_search = bool(llm_cfg.get("enable_google_search", False))
+    enable_url_context = bool(llm_cfg.get("enable_url_context", True))
     
     # 生成参数（可选）
     temperature = llm_cfg.get("temperature")  # None 或浮点数
@@ -503,6 +549,7 @@ def main():
         log(f"- api_base: (使用默认 Google API)")
     log(f"- parallel: {parallel}, retry_times: {retry_times}, retry_delay: {retry_delay}s, timeout: {timeout}s")
     log(f"- enable_google_search: {enable_google_search}")
+    log(f"- enable_url_context: {enable_url_context}")
     if temperature is not None:
         log(f"- temperature: {temperature}")
     if thinking_budget is not None:
@@ -524,19 +571,34 @@ def main():
         print(f"无法创建 GenAI 客户端：{e}", file=sys.stderr)
         sys.exit(2)
 
-    # 创建工具（如果启用联网搜索）
+    # 创建工具（联网搜索和 URL Context）
     tools = None
+    tools_list = []
+    
     if enable_google_search:
         try:
             # 创建 Google Search 工具（使用 google_search 而不是 google_search_retrieval）
             # API 要求使用 google_search，而不是已弃用的 google_search_retrieval
             google_search = types.GoogleSearch()
             google_search_tool = types.Tool(google_search=google_search)
-            tools = [google_search_tool]
+            tools_list.append(google_search_tool)
             log("✓ 已启用 Google 联网搜索功能")
         except Exception as e:
             log(f"⚠ 创建 Google Search 工具失败: {e}，将不使用联网搜索")
-            tools = None
+    
+    if enable_url_context:
+        try:
+            # 创建 URL Context 工具，允许模型直接访问和理解网页内容
+            # 注意：类名是 UrlContext（驼峰命名），不是 URLContext
+            url_context = types.UrlContext()
+            url_context_tool = types.Tool(url_context=url_context)
+            tools_list.append(url_context_tool)
+            log("✓ 已启用 URL Context 功能（模型可直接访问网页内容）")
+        except Exception as e:
+            log(f"⚠ 创建 URL Context 工具失败: {e}，将不使用 URL Context")
+    
+    if tools_list:
+        tools = tools_list
 
     # 读 Excel
     try:
@@ -548,44 +610,89 @@ def main():
     ws_prompt = get_sheet(wb, "prompt")
     ws_qa = get_sheet(wb, "QA")
 
-    # 系统提示（prompt!A1）
-    sys_prompt = ws_prompt["A1"].value
-    if sys_prompt is None or str(sys_prompt).strip() == "":
-        print("prompt!A1 不能为空", file=sys.stderr)
+    # 读取 prompt 表（第1行表头，第2行内容）
+    prompt_headers = find_header_indexes(ws_prompt)
+    if "system" not in prompt_headers or "user" not in prompt_headers:
+        print("prompt 表缺少必需列：system 或 user", file=sys.stderr)
         sys.exit(2)
+    
+    col_system = prompt_headers["system"]
+    col_user = prompt_headers["user"]
+    
+    sys_prompt = ws_prompt.cell(row=2, column=col_system).value
+    user_template = ws_prompt.cell(row=2, column=col_user).value
+    
+    if sys_prompt is None or str(sys_prompt).strip() == "":
+        print("prompt 表的 system 列（第2行）不能为空", file=sys.stderr)
+        sys.exit(2)
+    if user_template is None or str(user_template).strip() == "":
+        print("prompt 表的 user 列（第2行）不能为空", file=sys.stderr)
+        sys.exit(2)
+    
     sys_prompt = str(sys_prompt)
+    user_template = str(user_template)
+    
+    # 从用户模板中提取输入字段
+    input_fields = extract_template_vars(user_template)
+    if not input_fields:
+        print("user 模板中未找到任何 {{变量名}} 占位符", file=sys.stderr)
+        sys.exit(2)
+    
+    log(f"从 user 模板中提取到 {len(input_fields)} 个输入字段: {input_fields}")
 
     # QA 表头
     headers = find_header_indexes(ws_qa)
-    if "Q" not in headers:
-        print("QA 页缺少表头列：Q", file=sys.stderr)
+    
+    # 验证输入字段是否都在 QA 表中
+    missing_fields = [f for f in input_fields if f not in headers]
+    if missing_fields:
+        print(f"QA 表缺少模板所需的输入字段: {missing_fields}", file=sys.stderr)
         sys.exit(2)
-    # 确保必要列
+    
+    # 确保控制列存在
     headers = ensure_columns(ws_qa, headers, [COL_FOUND, COL_ERROR])
-    col_Q = headers["Q"]
     col_found = headers[COL_FOUND]
     col_err = headers[COL_ERROR]
-
-    # 输出字段集合：表头中除去 Q/是否找到/错误 的其它列（仅写这些）
-    output_cols = {k: v for k, v in headers.items() if k not in ("Q", COL_FOUND, COL_ERROR)}
+    
+    # 输入字段列映射
+    input_cols = {field: headers[field] for field in input_fields}
+    
+    # 输出字段集合：表头中除去输入字段、FOUND、ERROR 的其它列（仅写这些）
+    excluded = set(input_fields) | {COL_FOUND, COL_ERROR}
+    output_cols = {k: v for k, v in headers.items() if k not in excluded}
 
     data_start_row = 2
     data_end_row_initial = ws_qa.max_row  # 启动时的原始末行（用于 rows 范围）
     target_rows = parse_rows_arg(args.rows, data_start_row, data_end_row_initial)
 
-    # 统计去重 Q：全部候选 + 已完成
-    q_all = []
-    q_done_set = set()
+    # 统计去重：基于输入字段组合元组
+    input_tuples_all = []
+    input_tuples_done_set = set()
     for r in target_rows:
-        qv = ws_qa.cell(row=r, column=col_Q).value
-        if qv is None or str(qv).strip() == "":
+        # 读取所有输入字段值
+        values = {}
+        skip_row = False
+        for field, col in input_cols.items():
+            val = ws_qa.cell(row=r, column=col).value
+            if is_empty_value(val):
+                skip_row = True
+                break
+            values[field] = str(val)
+        
+        if skip_row:
             continue
-        q_all.append(str(qv))
+        
+        # 创建元组作为唯一标识
+        tuple_key = tuple(values[field] for field in input_fields)
+        input_tuples_all.append(tuple_key)
+        
+        # 检查是否已完成
         found_v = ws_qa.cell(row=r, column=col_found).value
-        if found_v is not None and str(found_v).strip() != "":
-            q_done_set.add(str(qv))
-    q_all_unique = set(q_all)
-    log(f"候选 Q 去重统计：总 {len(q_all_unique)}，其中已完成 {len(q_done_set)}")
+        if not is_empty_value(found_v):
+            input_tuples_done_set.add(tuple_key)
+    
+    unique_inputs = set(input_tuples_all)
+    log(f"输入组合去重统计：总 {len(unique_inputs)} 组，其中已完成 {len(input_tuples_done_set)} 组")
 
     # 为 rows 范围执行插入偏移跟踪：记录"原始主行" -> 插入的额外行数
     inserted_below: Dict[int, int] = {}
@@ -619,29 +726,46 @@ def main():
 
     for idx, r0 in enumerate(target_rows, start=1):
         r = current_row_pos(r0)
-        qv = ws_qa.cell(row=r, column=col_Q).value
-        qtext = "" if qv is None else str(qv).strip()
-
-        # 判定是否跳过（断点续跑：主行 是否找到 非空就跳过）
+        
+        # 读取所有输入字段值
+        input_values = {}
+        empty_fields = []
+        for field, col in input_cols.items():
+            val = ws_qa.cell(row=r, column=col).value
+            if is_empty_value(val):
+                empty_fields.append(field)
+            else:
+                input_values[field] = str(val)
+        
+        # 生成字段预览字符串（用于日志）
+        preview_parts = [f"{field}='{compact_preview(input_values.get(field, ''), 20)}'" 
+                        for field in input_fields]
+        input_preview = "[" + ", ".join(preview_parts) + "]"
+        
+        # 判定是否跳过（断点续跑：FOUND 非空就跳过）
         found_val = ws_qa.cell(row=r, column=col_found).value
-        if found_val is not None and str(found_val).strip() != "":
+        if not is_empty_value(found_val):
             n_done += 1
-            log(f"{idx}/{total} 跳过（已完成） r={r} Q='{compact_preview(qtext)}'")
+            log(f"{idx}/{total} 跳过（已完成） r={r} {input_preview}")
             continue
 
-        if qtext == "":
-            # 空 Q：标记错误并继续
+        # 验证输入字段不能为空
+        if empty_fields:
+            error_msg = f"输入字段为空: {', '.join(empty_fields)}"
             ws_qa.cell(row=r, column=col_found, value="错误")
-            ws_qa.cell(row=r, column=col_err, value="Q 为空")
+            ws_qa.cell(row=r, column=col_err, value=error_msg)
             save_with_backup_atomic(wb, xlsx_path, made_backup)
             n_done += 1
             n_error += 1
-            log(f"{idx}/{total} 错误：Q 为空（r={r}），已落盘")
+            log(f"{idx}/{total} 错误 r={r} {input_preview} -> {error_msg}")
             continue
 
+        # 填充用户模板
+        user_content = fill_template(user_template, input_values)
+        
         # 请求
         arr, usage, err = retry_call(
-            client, model_id, sys_prompt, qtext, timeout, tools,
+            client, model_id, sys_prompt, user_content, timeout, tools,
             temperature, thinking_budget, args.debug
         )
 
@@ -656,7 +780,7 @@ def main():
             save_with_backup_atomic(wb, xlsx_path, made_backup)
             n_done += 1
             n_error += 1
-            log(f"{idx}/{total} 错误 r={r} Q='{compact_preview(qtext)}' -> {err}")
+            log(f"{idx}/{total} 错误 r={r} {input_preview} -> {err}")
             continue
 
         # arr 一定是 list[dict]
@@ -671,43 +795,59 @@ def main():
             inserted_below[r0] = 0
             n_done += 1
             n_empty += 1
-            log(f"{idx}/{total} 空结果 r={r} Q='{compact_preview(qtext)}'（已落盘）")
+            log(f"{idx}/{total} 空结果 r={r} {input_preview}（已落盘）")
             continue
 
         # 有结果：主行写第1个，下面插入 len(arr)-1 行写其余
-        # 所有展开行的 Q 与 是否找到 相同
-        ws_qa.cell(row=r, column=col_Q, value=qtext)
+        # 关键：在修改主行之前，先读取原行的所有列值（用于拷贝到展开行）
+        extra = max(0, len(arr) - 1)
+        row_values = {}
+        if extra > 0:
+            # 先保存主行的所有原始列值
+            for col_idx in range(1, ws_qa.max_column + 1):
+                cell_value = ws_qa.cell(row=r, column=col_idx).value
+                row_values[col_idx] = cell_value
+        
+        # 现在修改主行：只更新输出字段和控制字段，保持其他字段不变
         ws_qa.cell(row=r, column=col_found, value="是")
         ws_qa.cell(row=r, column=col_err, value="")
-        # 写输出字段
+        # 写输出字段（只写入 JSON 中存在的字段，避免覆盖原有数据）
         first_obj = arr[0]
         for name, c in output_cols.items():
-            v = first_obj.get(name, "")
-            if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
-            ws_qa.cell(row=r, column=c, value=v)
+            if name in first_obj:  # 只有 JSON 中存在该字段时才写入
+                v = first_obj[name]
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False)
+                ws_qa.cell(row=r, column=c, value=v)
 
-        extra = max(0, len(arr) - 1)
+        # 插入展开行
         if extra > 0:
             ws_qa.insert_rows(r + 1, amount=extra)
             # 逐条写入
             for i in range(extra):
                 rr = r + 1 + i
-                ws_qa.cell(row=rr, column=col_Q, value=qtext)
+                # 先拷贝主行的所有列值
+                for col_idx, value in row_values.items():
+                    ws_qa.cell(row=rr, column=col_idx, value=value)
+                
+                # 然后覆盖控制字段
                 ws_qa.cell(row=rr, column=col_found, value="是")
                 ws_qa.cell(row=rr, column=col_err, value="")
+                
+                # 最后覆盖输出字段（写入新结果，只写入 JSON 中存在的字段）
                 obj = arr[1 + i]
                 for name, c in output_cols.items():
-                    v = obj.get(name, "")
-                    if isinstance(v, (dict, list)):
-                        v = json.dumps(v, ensure_ascii=False)
-                    ws_qa.cell(row=rr, column=c, value=v)
+                    if name in obj:  # 只有 JSON 中存在该字段时才写入
+                        v = obj[name]
+                        if isinstance(v, (dict, list)):
+                            v = json.dumps(v, ensure_ascii=False)
+                        ws_qa.cell(row=rr, column=c, value=v)
 
         inserted_below[r0] = extra
         save_with_backup_atomic(wb, xlsx_path, made_backup)
         n_done += 1
         n_success += 1
-        log(f"{idx}/{total} 成功 r={r} Q='{compact_preview(qtext)}' 展开 {len(arr)} 行（已落盘）")
+        log(f"{idx}/{total} 成功 r={r} {input_preview} 展开 {len(arr)} 行（已落盘）")
 
     # 结束统计
     cost = 0.0
